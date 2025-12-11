@@ -1,0 +1,169 @@
+import os
+import math
+import json
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.applications.resnet import preprocess_input as resnet_preprocess
+from sklearn.utils.class_weight import compute_class_weight
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+DATASET_DIR = "https://drive.google.com/drive/folders/1Er5Fdlt_zHY8W6mxukj_btCk8ihLqY4N?usp=drive_link"   
+SAVE_LABELS_JSON = "/content/class_indices.json"
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+SEED = 42
+AUTOTUNE = tf.data.AUTOTUNE
+
+dataset = tf.keras.preprocessing.image_dataset_from_directory(
+    DATASET_DIR,
+    labels="inferred",
+    label_mode="categorical",   
+    batch_size=BATCH_SIZE,
+    image_size=IMG_SIZE,
+    shuffle=True,
+    seed=SEED
+)
+
+class_names = dataset.class_names
+num_classes = len(class_names)
+print("Classes:", class_names)
+
+with open(SAVE_LABELS_JSON, "w") as f:
+    json.dump({"class_names": class_names}, f, indent=2)
+
+
+def split_dataset(directory, val_split=0.15, test_split=0.15):
+    
+    image_paths = []
+    labels = []
+    classes = sorted([d.name for d in Path(directory).iterdir() if d.is_dir()])
+    for idx, cls in enumerate(classes):
+        p = Path(directory) / cls
+        for img in p.glob("*"):
+            if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                image_paths.append(str(img))
+                labels.append(idx)
+    
+    rng = np.random.default_rng(SEED)
+    order = rng.permutation(len(image_paths))
+    image_paths = np.array(image_paths)[order]
+    labels = np.array(labels)[order]
+    n = len(image_paths)
+    n_test = int(n * test_split)
+    n_val = int(n * val_split)
+    test_idx = slice(0, n_test)
+    val_idx = slice(n_test, n_test + n_val)
+    train_idx = slice(n_test + n_val, None)
+    return (image_paths[train_idx], labels[train_idx],
+            image_paths[val_idx], labels[val_idx],
+            image_paths[test_idx], labels[test_idx],
+            classes)
+
+
+data_augmentation = tf.keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.12),
+    layers.RandomZoom(0.08),
+    layers.RandomTranslation(0.06, 0.06),
+    layers.RandomContrast(0.08)
+], name="data_augmentation")
+
+def prepare_for_training(ds, augment=False, cache=True, shuffle_buffer=1000):
+    ds = ds.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=AUTOTUNE)
+    if augment:
+        ds = ds.map(lambda x, y: (data_augmentation(x, training=True), y), num_parallel_calls=AUTOTUNE)
+    
+    ds = ds.map(lambda x, y: (resnet_preprocess(x), y), num_parallel_calls=AUTOTUNE)
+    if cache:
+        ds = ds.cache()
+    ds = ds.shuffle(shuffle_buffer, seed=SEED).prefetch(AUTOTUNE)
+    return ds
+
+
+def split_dataset_from_tf(ds, val_ratio=0.15):
+
+    all_batches = list(ds)
+    n_batches = len(all_batches)
+    n_val = max(1, int(n_batches * val_ratio))
+    val_batches = all_batches[:n_val]
+    train_batches = all_batches[n_val:]
+    train_ds = tf.data.Dataset.from_tensor_slices(([],[]))  
+    train_ds = tf.data.Dataset.from_generator(lambda: (b for b in train_batches), output_types=(tf.float32, tf.float32))
+    val_ds = tf.data.Dataset.from_generator(lambda: (b for b in val_batches), output_types=(tf.float32, tf.float32))
+    return train_ds, val_ds
+
+train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    DATASET_DIR,
+    validation_split=0.15,
+    subset="training",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="categorical"
+)
+
+val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    DATASET_DIR,
+    validation_split=0.15,
+    subset="validation",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="categorical"
+)
+
+
+train_ds = prepare_for_training(train_ds, augment=True)
+val_ds = prepare_for_training(val_ds, augment=False)
+
+def compute_class_weights_from_dir(directory, class_names_list):
+    counts = []
+    for cls in class_names_list:
+        p = Path(directory) / cls
+        c = sum(1 for _ in p.glob("*") if _.suffix.lower() in [".jpg", ".jpeg", ".png"])
+        counts.append(c)
+    labels = np.arange(len(class_names_list))
+     
+    y = []
+    for i, c in enumerate(counts):
+        y += [i] * c
+    y = np.array(y)
+    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+    return dict(enumerate(class_weights)), counts
+
+class_weights, counts = compute_class_weights_from_dir(DATASET_DIR, class_names)
+print("Counts per class:", dict(zip(class_names, counts)))
+print("Class weights:", class_weights)
+
+
+def show_examples(dataset, class_names, n=6):
+    plt.figure(figsize=(12,6))
+    for images, labels in dataset.take(1):
+        labels_idx = tf.argmax(labels, axis=1).numpy()
+        for i in range(n):
+            ax = plt.subplot(2, 3, i+1)
+            img = images[i].numpy().astype("uint8")
+            plt.imshow(img)
+            plt.title(class_names[labels_idx[i]])
+            plt.axis("off")
+    plt.show()
+
+
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
+from tensorflow.keras.models import Model
+base = ResNet50(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+base.trainable = False
+x = base.output
+x = GlobalAveragePooling2D()(x)
+x = Dropout(0.3)(x)
+preds = Dense(num_classes, activation='softmax')(x)
+example_model = Model(inputs=base.input, outputs=preds)
+example_model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+
+
+print("Preprocessing pipeline ")
+print("Saved class mapping to:", SAVE_LABELS_JSON)
